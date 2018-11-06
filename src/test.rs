@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use span::{Column, Position, Row};
+use span::{self, Column, Position, Row};
 
 use super::{
-    make_line_indices, Change, Error, File, FileContents, FileKind, FileLoader, SpanAtom, TextFile,
+    make_line_indices, Change, Error, File, FileContents, FileKind, FileLoader, TextFile,
     VfsInternal,
 };
-use Span;
+use {Span, SpanLength, UnicodeScalarValue, Utf16CodeUnit};
 
 struct MockFileLoader;
 
@@ -45,16 +45,15 @@ fn make_change(with_len: bool) -> Change {
         (1, 4, None)
     };
     Change::ReplaceText {
-        span: Span::new(
+        span: Span::from(span::Span::<span::ZeroIndexed>::new(
             Row::new_zero_indexed(1),
             Row::new_zero_indexed(row_end),
             Column::new_zero_indexed(1),
             Column::new_zero_indexed(col_end),
             "foo",
-        ),
-        len: len,
+        )),
+        len: len.map(SpanLength::from),
         text: "foo".to_owned(),
-        atom: SpanAtom::UnicodeScalarValue,
     }
 }
 
@@ -67,16 +66,15 @@ fn make_change_2(with_len: bool) -> Change {
         (3, 2, None)
     };
     Change::ReplaceText {
-        span: Span::new(
+        span: Span::from(span::Span::<span::ZeroIndexed>::new(
             Row::new_zero_indexed(2),
             Row::new_zero_indexed(row_end),
             Column::new_zero_indexed(4),
             Column::new_zero_indexed(col_end),
             "foo",
-        ),
-        len: len,
+        )),
+        len: len.map(SpanLength::from),
         text: "aye carumba".to_owned(),
-        atom: SpanAtom::UnicodeScalarValue,
     }
 }
 
@@ -165,7 +163,7 @@ fn test_changes_with_len() {
 #[test]
 fn test_change_add_file() {
     let vfs = VfsInternal::<MockFileLoader, ()>::new();
-    let new_file = Change::AddFile {
+    let new_file: Change<UnicodeScalarValue> = Change::AddFile {
         file: PathBuf::from("foo"),
         text: "Hello, World!".to_owned(),
     };
@@ -319,14 +317,13 @@ fn test_wide_utf8() {
             text: String::from("😢"),
         },
         Change::ReplaceText {
-            span: Span::from_positions(
+            span: Span::<UnicodeScalarValue>::from(span::Span::<span::ZeroIndexed>::from_positions(
                 Position::new(Row::new_zero_indexed(0), Column::new_zero_indexed(0)),
                 Position::new(Row::new_zero_indexed(0), Column::new_zero_indexed(1)),
                 "foo",
-            ),
-            len: Some(1),
+            )),
+            len: Some(SpanLength::from(1)),
             text: "".into(),
-            atom: SpanAtom::UnicodeScalarValue,
         },
     ];
 
@@ -347,14 +344,13 @@ fn test_wide_utf16() {
             text: String::from("😢"),
         },
         Change::ReplaceText {
-            span: Span::from_positions(
+            span: Span::from(span::Span::<span::ZeroIndexed>::from_positions(
                 Position::new(Row::new_zero_indexed(0), Column::new_zero_indexed(0)),
                 Position::new(Row::new_zero_indexed(0), Column::new_zero_indexed(2)),
                 "foo",
-            ),
-            len: Some(2),
+            )),
+            len: Some(SpanLength::<Utf16CodeUnit>::from(2)),
             text: "".into(),
-            atom: SpanAtom::Utf16CodeUnit,
         },
     ];
 

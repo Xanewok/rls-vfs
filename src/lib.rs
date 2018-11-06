@@ -4,8 +4,9 @@ extern crate rls_span as span;
 #[macro_use]
 extern crate log;
 
+use std::ops::Deref;
 use std::collections::HashMap;
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::fs;
 use std::io::Read;
 use std::marker::PhantomData;
@@ -28,48 +29,108 @@ macro_rules! try_opt_loc {
 
 pub struct Vfs<U = ()>(VfsInternal<RealFileLoader, U>);
 
-type Span = span::Span<span::ZeroIndexed>;
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Span<T = UnicodeScalarValue>(pub span::Span<span::ZeroIndexed>, PhantomData<T>)
+where
+    T: Split;
 
-#[derive(Debug)]
-/// Defines a smallest text unit that `Span`s operate with.
-pub enum SpanAtom {
-    /// `char` primitive
-    UnicodeScalarValue,
-    /// `u16` component in UTF-16 encoding
-    Utf16CodeUnit
+impl<T: Split> Deref for Span<T> {
+    type Target = span::Span<span::ZeroIndexed>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-impl Default for SpanAtom {
-    fn default() -> Self {
-        SpanAtom::UnicodeScalarValue
+impl<T: Split> From<span::Span<span::ZeroIndexed>> for Span<T> {
+    fn from(value: span::Span<span::ZeroIndexed>) -> Span<T> {
+        Span(value, PhantomData)
+    }
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpanLength<T = UnicodeScalarValue>(pub u64, PhantomData<T>)
+where
+    T: Split;
+
+impl<T: Split> From<u64> for SpanLength<T> {
+    fn from(value: u64) -> SpanLength<T> {
+        SpanLength(value, PhantomData)
+    }
+}
+
+/// Defines a smallest text unit that `Span`s operate with.
+pub trait Split: Debug {
+    /// Return a UTF-8 byte offset in `s` for a given offset.
+    fn byte_offset(s: &str, c: span::Column<span::ZeroIndexed>) -> Result<usize, Error>;
+}
+/// `char` primitive
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnicodeScalarValue {}
+/// `u16` component in UTF-16 encoding
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Utf16CodeUnit {}
+impl Split for UnicodeScalarValue {
+    fn byte_offset(s: &str, c: span::Column<span::ZeroIndexed>) -> Result<usize, Error> {
+        // We simulate a null-terminated string here because spans are exclusive at
+        // the top, and so that index might be outside the length of the string.
+        for (i, (b, _)) in s
+            .char_indices()
+            .chain(Some((s.len(), '\0')).into_iter())
+            .enumerate()
+        {
+            if c.0 as usize == i {
+                return Ok(b);
+            }
+        }
+
+        return Err(Error::InternalError(
+            "Out of bounds access in `byte_offset`",
+        ));
+    }
+}
+
+impl Split for Utf16CodeUnit {
+    fn byte_offset(s: &str, c: span::Column<span::ZeroIndexed>) -> Result<usize, Error> {
+        let (mut utf8_offset, mut utf16_offset) = (0, 0);
+        let target_utf16_offset = c.0 as usize;
+
+        for chr in s.chars().chain(std::iter::once('\0')) {
+            if utf16_offset > target_utf16_offset {
+                break;
+            } else if utf16_offset == target_utf16_offset {
+                return Ok(utf8_offset);
+            }
+
+            utf8_offset += chr.len_utf8();
+            utf16_offset += chr.len_utf16();
+        }
+
+        return Err(Error::InternalError(
+            "UTF-16 code unit offset is not at `str` char boundary",
+        ));
     }
 }
 
 #[derive(Debug)]
-pub enum Change {
+pub enum Change<T:Split = UnicodeScalarValue> {
     /// Create an in-memory image of the file.
     AddFile { file: PathBuf, text: String },
     /// Changes in-memory contents of the previously added file.
     ReplaceText {
         /// Span of the text to be replaced defined in col/row terms.
-        span: Span,
+        span: Span<T>,
         /// Length in chars of the text to be replaced. If present,
         /// used to calculate replacement range instead of
         /// span's row_end/col_end fields. Needed for editors that
         /// can't properly calculate the latter fields.
         /// Span's row_start/col_start are still assumed valid.
-        len: Option<u64>,
-        /// Specifies the atom units used by `span` and `len`.
-        /// For example, a buffer of "😢" has a column span of 0 to 1 and length
-        /// equal to 1 with `SpanAtom::UnicodeScalarValue` but a column span
-        /// of 0 to 2 and length equal to 2 with `SpanAtom::Utf16CodeUnit`.
-        atom: SpanAtom,
+        len: Option<SpanLength<T>>,
         /// Text to replace specified text range with.
         text: String,
     },
 }
 
-impl Change {
+impl<T: Split> Change<T> {
     fn file(&self) -> &Path {
         match *self {
             Change::AddFile { ref file, .. } => file.as_ref(),
@@ -166,7 +227,7 @@ impl<U> Vfs<U> {
     }
 
     /// Record a set of changes to the VFS.
-    pub fn on_changes(&self, changes: &[Change]) -> Result<(), Error> {
+    pub fn on_changes<S: Split>(&self, changes: &[Change<S>]) -> Result<(), Error> {
         self.0.on_changes(changes)
     }
 
@@ -313,7 +374,7 @@ impl<T: FileLoader, U> VfsInternal<T, U> {
         }
     }
 
-    fn on_changes(&self, changes: &[Change]) -> Result<(), Error> {
+    fn on_changes<S: Split>(&self, changes: &[Change<S>]) -> Result<(), Error> {
         trace!("on_changes: {:?}", changes);
         for (file_name, changes) in coalesce_changes(changes) {
             let path = Path::new(file_name);
@@ -558,7 +619,7 @@ impl<T: FileLoader, U> VfsInternal<T, U> {
     }
 }
 
-fn coalesce_changes<'a>(changes: &'a [Change]) -> HashMap<&'a Path, Vec<&'a Change>> {
+fn coalesce_changes<'a, S: Split>(changes: &'a [Change<S>]) -> HashMap<&'a Path, Vec<&'a Change<S>>> {
     // Note that for any given file, we preserve the order of the changes.
     let mut result = HashMap::new();
     for c in changes {
@@ -620,7 +681,7 @@ impl<U> File<U> {
         }
     }
 
-    fn make_change(&mut self, changes: &[&Change]) -> Result<(), Error> {
+    fn make_change<S: Split>(&mut self, changes: &[&Change<S>]) -> Result<(), Error> {
         match self.kind {
             FileKind::Text(ref mut t) => {
                 self.user_data = None;
@@ -674,7 +735,7 @@ impl<U> File<U> {
 }
 
 impl TextFile {
-    fn make_change(&mut self, changes: &[&Change]) -> Result<(), Error> {
+    fn make_change<S: Split>(&mut self, changes: &[&Change<S>]) -> Result<(), Error> {
         trace!("TextFile::make_change");
         for c in changes {
             trace!("TextFile::make_change: {:?}", c);
@@ -683,31 +744,25 @@ impl TextFile {
                     ref span,
                     ref len,
                     ref text,
-                    ref atom,
                 } => {
-                    let byte_in_str = match atom {
-                        SpanAtom::UnicodeScalarValue => byte_in_str,
-                        SpanAtom::Utf16CodeUnit => byte_in_str_utf16,
-                    };
-
                     let range = {
                         let first_line = self.load_line(span.range.row_start)?;
                         let byte_start = self.line_indices[span.range.row_start.0 as usize]
-                            + byte_in_str(first_line, span.range.col_start)? as u32;
+                            + S::byte_offset(first_line, span.range.col_start)? as u32;
 
-                        let byte_end = if let &Some(len) = len {
+                        let byte_end = if let Some(ref len) = len {
                             // if `len` exists, the replaced portion of text
                             // is `len` chars starting from row_start/col_start.
-                            byte_start + byte_in_str(
+                            byte_start + S::byte_offset(
                                 &self.text[byte_start as usize..],
-                                span::Column::new_zero_indexed(len as u32),
+                                span::Column::new_zero_indexed(len.0 as u32),
                             )? as u32
                         } else {
                             // if no `len`, fall back to using row_end/col_end
                             // for determining the tail end of replaced text.
                             let last_line = self.load_line(span.range.row_end)?;
                             self.line_indices[span.range.row_end.0 as usize]
-                                + byte_in_str(last_line, span.range.col_end)? as u32
+                                + S::byte_offset(last_line, span.range.col_end)? as u32
                         };
 
                         (byte_start, byte_end)
@@ -795,46 +850,6 @@ impl TextFile {
     }
 }
 
-/// Return a UTF-8 byte offset in `s` for a given UTF-8 unicode scalar value offset.
-fn byte_in_str(s: &str, c: span::Column<span::ZeroIndexed>) -> Result<usize, Error> {
-    // We simulate a null-terminated string here because spans are exclusive at
-    // the top, and so that index might be outside the length of the string.
-    for (i, (b, _)) in s
-        .char_indices()
-        .chain(Some((s.len(), '\0')).into_iter())
-        .enumerate()
-    {
-        if c.0 as usize == i {
-            return Ok(b);
-        }
-    }
-
-    return Err(Error::InternalError(
-        "Out of bounds access in `byte_in_str`",
-    ));
-}
-
-/// Return a UTF-8 byte offset in `s` for a given UTF-16 code unit offset.
-fn byte_in_str_utf16(s: &str, c: span::Column<span::ZeroIndexed>) -> Result<usize, Error> {
-    let (mut utf8_offset, mut utf16_offset) = (0, 0);
-    let target_utf16_offset = c.0 as usize;
-
-    for chr in s.chars().chain(std::iter::once('\0')) {
-        if utf16_offset > target_utf16_offset {
-            break;
-        } else if utf16_offset == target_utf16_offset {
-            return Ok(utf8_offset);
-        }
-
-        utf8_offset += chr.len_utf8();
-        utf16_offset += chr.len_utf16();
-    }
-
-    return Err(Error::InternalError(
-        "UTF-16 code unit offset is not at `str` char boundary",
-    ));
-}
-
 trait FileLoader {
     fn read<U>(file_name: &Path) -> Result<File<U>, Error>;
     fn write(file_name: &Path, file: &FileKind) -> Result<(), Error>;
@@ -900,17 +915,18 @@ impl FileLoader for RealFileLoader {
 #[cfg(test)]
 mod tests {
     use span::Column;
+    use super::{Split, Utf16CodeUnit};
 
     #[test]
-    fn byte_in_str_utf16() {
-        use super::byte_in_str_utf16;
+    fn byte_offset_utf16() {
+        let byte_offset_utf16 = <Utf16CodeUnit as Split>::byte_offset;
 
         assert_eq!(
             '😢'.len_utf8(),
-            byte_in_str_utf16("😢a", Column::new_zero_indexed('😢'.len_utf16() as u32)).unwrap()
+            byte_offset_utf16("😢a", Column::new_zero_indexed('😢'.len_utf16() as u32)).unwrap()
         );
 
         // 😢 is represented by 2 u16s - we can't index in the middle of a character
-        assert!(byte_in_str_utf16("😢", Column::new_zero_indexed(1)).is_err());
+        assert!(byte_offset_utf16("😢", Column::new_zero_indexed(1)).is_err());
     }
 }
